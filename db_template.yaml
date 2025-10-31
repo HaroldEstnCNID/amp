@@ -1,0 +1,221 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Template para desplegar una base de datos RDS MariaDB privada y un Bastion Host
+  PUBLICO. El bastion es accesible de forma segura via SSM (sin NAT).
+  ATENCION: Este template asume que la VPC ya tiene subredes publicas
+  (con un IGW) y subredes de BD aisladas.
+
+Parameters:
+  ProjectTag:
+    Description: El valor para el tag 'Project'.
+    Type: String
+    Default: "Demo-Project"
+
+  VpcId:
+    Description: El ID de la VPC donde se desplegaran los recursos.
+    Type: AWS::EC2::VPC::Id
+
+  PublicSubnetIds:
+    Description: Lista de Subredes Publicas para el Bastion Host. Debe tener ruta a un IGW.
+    Type: List<AWS::EC2::Subnet::Id>
+
+  PrivateDBSubnetIds:
+    Description: Lista de Subredes Privadas (de BD) para la base de datos. Minimo 2 en AZs diferentes.
+    Type: List<AWS::EC2::Subnet::Id>
+
+  BastionInstanceType:
+    Description: Tipo de instancia para el Bastion Host.
+    Type: String
+    Default: t3.micro
+    AllowedValues:
+      - t3.nano
+      - t3.micro
+      - t3.small
+      - t2.nano
+      - t2.micro
+      - t2.small
+
+  DBInstanceClass:
+    Description: Clase de instancia para la base de datos RDS.
+    Type: String
+    Default: db.t3.micro
+    AllowedValues:
+      - db.t3.micro
+      - db.t3.small
+      - db.t4g.micro
+      - db.t4g.small
+
+  DBUsername:
+    Description: Nombre de usuario administrador para la base de datos.
+    Type: String
+    Default: admin
+    MinLength: 4
+    MaxLength: 16
+    AllowedPattern: "[a-zA-Z][a-zA-Z0-9]*"
+
+  DBPassword:
+    Description: Contrasena para el usuario administrador de la base de datos.
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 41
+    AllowedPattern: "^[a-zA-Z0-9@#$%^&*()_+=-]+$"
+
+  DBName:
+    Description: Nombre de la base de datos la base de datos.
+    Type: String
+    Default: ampdatabase
+
+  LatestAmiId:
+    Description: (Opcional) ID de la AMI de Amazon Linux 2023. Dejar para usar la mas reciente.
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64'
+
+Resources:
+  # --- Rol y Perfil de Instancia para SSM ---
+  BastionIAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectTag}-Bastion-Role"
+        - Key: Project
+          Value: !Ref ProjectTag
+
+  BastionInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref BastionIAMRole
+
+  # --- Grupos de Seguridad ---
+  BastionSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${ProjectTag}-Bastion-SG"
+      GroupDescription: "Grupo de seguridad para el Bastion Host. Sin reglas inbound (solo SSM)."
+      VpcId: !Ref VpcId
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectTag}-Bastion-SG"
+        - Key: Project
+          Value: !Ref ProjectTag
+
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${ProjectTag}-Database-SG"
+      GroupDescription: "Permite acceso a la BD solo desde el Bastion Host"
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref BastionSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectTag}-Database-SG"
+        - Key: Project
+          Value: !Ref ProjectTag
+
+  # --- Bastion Host Publico ---
+  BastionHost:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref BastionInstanceType
+      ImageId: !Ref LatestAmiId
+      IamInstanceProfile: !Ref BastionInstanceProfile
+      NetworkInterfaces:
+        - DeviceIndex: "0"
+          AssociatePublicIpAddress: true # <-- Propiedad correcta
+          DeleteOnTermination: true
+          SubnetId: !Select [ 0, !Ref PublicSubnetIds ] # <-- SubnetId va aqui
+          GroupSet: # <-- SecurityGroupIds se reemplaza por GroupSet aqui
+            - !Ref BastionSecurityGroup
+      UserData: !Base64 |
+        #!/bin/bash
+        # Instalar cliente de MariaDB (mysql)
+        sudo dnf update -y
+        sudo dnf install -y mariadb105-server
+        sudo systemctl enable mariadb --now
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectTag}-Bastion-Host"
+        - Key: Project
+          Value: !Ref ProjectTag
+
+  # --- Base de Datos RDS ---
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: "Grupo de subredes privadas para la BD"
+      SubnetIds: !Ref PrivateDBSubnetIds
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+
+  DatabaseInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBName: !Ref DBName
+      Engine: "mariadb"
+      DBInstanceClass: !Ref DBInstanceClass
+      AllocatedStorage: "20"
+      StorageType: "gp3"
+      MasterUsername: !Ref DBUsername
+      MasterUserPassword: !Ref DBPassword
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - !Ref DatabaseSecurityGroup
+      PubliclyAccessible: false
+      MultiAZ: false
+      BackupRetentionPeriod: 0
+      DeleteAutomatedBackups: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectTag}-Database"
+        - Key: Project
+          Value: !Ref ProjectTag
+    DeletionPolicy: Delete
+
+Outputs:
+  BastionInstanceId:
+    Description: El ID de la instancia Bastion. Usalo para conectar via SSM.
+    Value: !Ref BastionHost
+    Export:
+      Name: !Sub "${ProjectTag}-BastionInstanceId"
+
+  BastionPublicIp:
+    Description: La IP publica del Bastion Host.
+    Value: !GetAtt BastionHost.PublicIp
+    Export:
+      Name: !Sub "${ProjectTag}-BastionPublicIp"
+
+  DatabaseEndpoint:
+    Description: El endpoint de la base de datos RDS.
+    Value: !GetAtt DatabaseInstance.Endpoint.Address
+    Export:
+      Name: !Sub "${ProjectTag}-DBEndpoint"
+
+  DatabasePort:
+    Description: El puerto de la base de datos RDS.
+    Value: !GetAtt DatabaseInstance.Endpoint.Port
+    Export:
+      Name: !Sub "${ProjectTag}-DBPort"
+
+  HowToConnect:
+    Description: "Como conectarse a la base de datos"
+    Value: !Sub |
+      1. Ve a la consola de EC2, selecciona la instancia con ID ${BastionHost}.
+      2. Haz clic en 'Conectar', elige 'Session Manager' y haz clic en 'Conectar'.
+      3. En la terminal del bastion, ejecuta:
+         mysql -h ${DatabaseInstance.Endpoint.Address} -u ${DBUsername} -p ${DBName}
